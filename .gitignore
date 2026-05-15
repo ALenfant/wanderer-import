@@ -1,3 +1,6 @@
+hike_urls.txt
+hike_urls*.txt
+
 .DS_Store
 /bin/
 /dist/
