@@ -2,6 +2,7 @@ package browserfetch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -51,7 +52,8 @@ func (f *PlaywrightFetcher) Fetch(ctx context.Context, pageURL, requestURL strin
 	}
 
 	contextOptions := playwright.BrowserNewContextOptions{
-		Locale: playwright.String("en-US"),
+		Locale:    playwright.String("en-US"),
+		UserAgent: playwright.String("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
 	}
 	browserContext, err := f.browser.NewContext(contextOptions)
 	if err != nil {
@@ -65,6 +67,38 @@ func (f *PlaywrightFetcher) Fetch(ctx context.Context, pageURL, requestURL strin
 	}
 	defer page.Close()
 
+	// Mask automation markers
+	_ = page.AddInitScript(playwright.Script{
+		Content: playwright.String(`
+			Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+			window.chrome = { runtime: {} };
+			Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+			Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+		`),
+	})
+
+	var capturedResponse []byte
+	var capturedErr error
+	var mu sync.Mutex
+
+	if requestURL != "" && requestURL != pageURL {
+		page.OnResponse(func(res playwright.Response) {
+			if strings.Contains(res.URL(), requestURL) {
+				mu.Lock()
+				defer mu.Unlock()
+				if capturedResponse != nil {
+					return
+				}
+				body, err := res.Body()
+				if err != nil {
+					capturedErr = err
+					return
+				}
+				capturedResponse = body
+			}
+		})
+	}
+
 	timeout := timeoutMillis(ctx, 30*time.Second)
 	if _, err := page.Goto(pageURL, playwright.PageGotoOptions{
 		Timeout:   playwright.Float(timeout),
@@ -72,54 +106,98 @@ func (f *PlaywrightFetcher) Fetch(ctx context.Context, pageURL, requestURL strin
 	}); err != nil {
 		return nil, fmt.Errorf("browser navigate %s: %w", pageURL, err)
 	}
-	page.WaitForTimeout(settleTimeoutMillis(ctx, 5*time.Second))
+	_ = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+		State:   playwright.LoadStateNetworkidle,
+		Timeout: playwright.Float(settleTimeoutMillis(ctx, 5*time.Second)),
+	})
+	page.WaitForTimeout(settleTimeoutMillis(ctx, 2*time.Second))
 
-	headerArg := make(map[string]any, len(opts.Headers))
-	for key, value := range opts.Headers {
-		headerArg[key] = value
-	}
-	cookieArg := make(map[string]any, len(opts.Cookies))
-	for key, value := range opts.Cookies {
-		cookieArg[key] = value
-	}
-	result, err := page.Evaluate(`async ({ url, headers, cookies }) => {
-		for (const [name, value] of Object.entries(cookies || {})) {
-			if (!document.cookie.includes(name + "=")) {
-				document.cookie = name + "=" + encodeURIComponent(value) + "; path=/; SameSite=Lax";
+	if requestURL == "" || requestURL == pageURL {
+		if opts.Script != "" {
+			result, err := page.Evaluate(opts.Script, nil)
+			if err != nil {
+				return nil, fmt.Errorf("browser evaluate script: %w", err)
+			}
+			switch typed := result.(type) {
+			case string:
+				return []byte(typed), nil
+			case []byte:
+				return typed, nil
+			default:
+				data, err := json.Marshal(result)
+				if err != nil {
+					return nil, fmt.Errorf("browser evaluate script returned non-serializable %T", result)
+				}
+				return data, nil
 			}
 		}
-		const response = await fetch(url, {
-			credentials: "same-origin",
-			cache: "no-store",
-			headers: headers || {},
-		});
-		const body = await response.text();
-		return {
-			status: response.status,
-			ok: response.ok,
-			body,
-		};
-	}`, map[string]any{"url": requestURL, "headers": headerArg, "cookies": cookieArg})
-	if err != nil {
-		return nil, fmt.Errorf("browser fetch %s: %w", requestURL, err)
+		content, err := page.Content()
+		if err != nil {
+			return nil, fmt.Errorf("browser get content %s: %w", pageURL, err)
+		}
+		return []byte(content), nil
 	}
 
-	payload, ok := result.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("browser fetch returned unexpected payload %T", result)
+	if requestURL != "" && requestURL != pageURL {
+		mu.Lock()
+		if capturedResponse != nil {
+			mu.Unlock()
+			return capturedResponse, nil
+		}
+		if capturedErr != nil {
+			mu.Unlock()
+			return nil, capturedErr
+		}
+		mu.Unlock()
+
+		headerArg := make(map[string]any, len(opts.Headers))
+		for key, value := range opts.Headers {
+			headerArg[key] = value
+		}
+		cookieArg := make(map[string]any, len(opts.Cookies))
+		for key, value := range opts.Cookies {
+			cookieArg[key] = value
+		}
+		result, err := page.Evaluate(`async ({ url, headers, cookies }) => {
+			for (const [name, value] of Object.entries(cookies || {})) {
+				if (!document.cookie.includes(name + "=")) {
+					document.cookie = name + "=" + encodeURIComponent(value) + "; path=/; SameSite=Lax";
+				}
+			}
+			const response = await fetch(url, {
+				credentials: "same-origin",
+				cache: "no-store",
+				headers: headers || {},
+			});
+			const body = await response.text();
+			return {
+				status: response.status,
+				ok: response.ok,
+				body,
+			};
+		}`, map[string]any{"url": requestURL, "headers": headerArg, "cookies": cookieArg})
+		if err != nil {
+			return nil, fmt.Errorf("browser fetch %s: %w", requestURL, err)
+		}
+
+		payload, ok := result.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("browser fetch returned unexpected payload %T", result)
+		}
+		status, ok := numericStatus(payload["status"])
+		if !ok {
+			return nil, fmt.Errorf("browser fetch returned payload without numeric status")
+		}
+		body, ok := payload["body"].(string)
+		if !ok {
+			return nil, fmt.Errorf("browser fetch returned payload without string body")
+		}
+		if status < 200 || status > 299 {
+			return nil, fmt.Errorf("browser fetch %s returned %d", requestURL, status)
+		}
+		return []byte(body), nil
 	}
-	status, ok := numericStatus(payload["status"])
-	if !ok {
-		return nil, fmt.Errorf("browser fetch returned payload without numeric status")
-	}
-	body, ok := payload["body"].(string)
-	if !ok {
-		return nil, fmt.Errorf("browser fetch returned payload without string body")
-	}
-	if status < 200 || status > 299 {
-		return nil, fmt.Errorf("browser fetch %s returned %d", requestURL, status)
-	}
-	return []byte(body), nil
+	return nil, nil // Should not reach here if pageURL was handled
 }
 
 func (f *PlaywrightFetcher) Close() error {
@@ -155,6 +233,9 @@ func (f *PlaywrightFetcher) ensureBrowser() error {
 
 	options := playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(f.opts.Headless),
+		Args: []string{
+			"--disable-blink-features=AutomationControlled",
+		},
 	}
 	var browser playwright.Browser
 	switch f.opts.Browser {

@@ -5,23 +5,39 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
+	"wanderer-import/internal/browserfetch"
 	"wanderer-import/internal/importer"
 	"wanderer-import/internal/providers/providerkit"
 	"wanderer-import/internal/wanderer"
 )
 
 type Provider struct {
-	httpClient *http.Client
+	httpClient     *http.Client
+	browserFetcher browserfetch.Fetcher
 }
 
 func New(httpClient *http.Client) *Provider {
-	return &Provider{httpClient: providerkit.HTTPClient(httpClient)}
+	return NewWithOptions(Options{HTTPClient: httpClient})
+}
+
+type Options struct {
+	HTTPClient     *http.Client
+	BrowserFetcher browserfetch.Fetcher
+}
+
+func NewWithOptions(opts Options) *Provider {
+	return &Provider{
+		httpClient:     providerkit.HTTPClient(opts.HTTPClient),
+		browserFetcher: opts.BrowserFetcher,
+	}
 }
 
 func (p *Provider) Name() string {
@@ -84,19 +100,108 @@ func (p *Provider) Resolve(ctx context.Context, spec importer.Spec) (*importer.R
 	}, nil
 }
 
+var (
+	googlebotUserAgent = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+	publicAPIKey      = os.Getenv("ALLTRAILS_API_KEY")
+)
+
 func (p *Provider) readSource(ctx context.Context, source string) ([]byte, error) {
 	if parsed, ok := providerkit.ParseHTTPURL(source); ok {
-		res, err := providerkit.GET(ctx, p.httpClient, parsed.String())
-		if err != nil {
-			return nil, err
+		// First try standard HTTP with Googlebot UA to bypass DataDome
+		if publicAPIKey != "" {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+			req.Header.Set("User-Agent", googlebotUserAgent)
+			res, err := p.httpClient.Do(req)
+			if err == nil {
+				defer res.Body.Close()
+				data, err := io.ReadAll(io.LimitReader(res.Body, 16<<20))
+				if err == nil && len(data) > 0 && !isDataDomeChallenge(data) {
+					// We got the page! Now extract the map ID and fetch the map API
+					if mapID := extractMapID(data); mapID != "" {
+						mapURL := fmt.Sprintf("https://www.alltrails.com/api/alltrails/v3/maps/%s?key=%s&detail=deep", mapID, publicAPIKey)
+						reqMap, _ := http.NewRequestWithContext(ctx, http.MethodGet, mapURL, nil)
+						reqMap.Header.Set("User-Agent", googlebotUserAgent)
+						resMap, err := p.httpClient.Do(reqMap)
+						if err == nil {
+							defer resMap.Body.Close()
+							mapData, err := io.ReadAll(io.LimitReader(resMap.Body, 16<<20))
+							if err == nil && len(mapData) > 0 && !isDataDomeChallenge(mapData) {
+								return mapData, nil
+							}
+						}
+					}
+					// If map fetch failed, return the page HTML and let the parser try to find JSON
+					return data, nil
+				}
+			}
 		}
-		defer res.Body.Close()
-		return io.ReadAll(io.LimitReader(res.Body, 16<<20))
+
+		// Fallback to browser fetch if Googlebot is also blocked or if key is missing
+		if p.browserFetcher != nil {
+			return p.browserFetcher.Fetch(ctx, parsed.String(), parsed.String(), browserfetch.RequestOptions{
+				Headers: map[string]string{"User-Agent": googlebotUserAgent},
+				Script: `async () => {
+					const getMapID = () => {
+						const ogImage = document.querySelector('meta[property="og:image"]');
+						if (ogImage) {
+							const match = ogImage.content.match(/\/maps\/(\d+)/);
+							if (match) return match[1];
+						}
+						return null;
+					};
+					const mapId = getMapID();
+					if (mapId) {
+						let apiUrl = "/api/alltrails/v3/maps/" + mapId + "?detail=deep";
+						const key = "` + publicAPIKey + `";
+						if (key) {
+							apiUrl += "&key=" + key;
+						}
+						const response = await fetch(apiUrl);
+						if (response.ok) return await response.text();
+					}
+					return document.documentElement.outerHTML;
+				}`,
+			})
+		}
+		return nil, fmt.Errorf("alltrails page fetch failed (DataDome)")
 	}
 	return os.ReadFile(source)
 }
 
+func isDataDomeChallenge(data []byte) bool {
+	s := string(data)
+	return strings.Contains(s, "captcha-delivery.com") || strings.Contains(s, "dd={'rt':'c'")
+}
+
+func extractMapID(data []byte) string {
+	s := string(data)
+	// Try og:image
+	reImage := regexp.MustCompile(`property="og:image"\s+content="[^"]+/maps/(\d+)`)
+	if match := reImage.FindStringSubmatch(s); len(match) > 1 {
+		return match[1]
+	}
+	// Try al:android:url
+	reAndroid := regexp.MustCompile(`property="al:android:url"\s+content="[^"]+/trails/(\d+)`)
+	if match := reAndroid.FindStringSubmatch(s); len(match) > 1 {
+		// Sometimes the trail ID and map ID are the same, or the map API works with trail ID
+		return match[1]
+	}
+	// Try any link to /maps/ID
+	reMapLink := regexp.MustCompile(`/maps/(\d+)`)
+	if match := reMapLink.FindStringSubmatch(s); len(match) > 1 {
+		return match[1]
+	}
+	return ""
+}
+
 func ParseV3Trail(data []byte) ([]providerkit.Point, wanderer.TrailUpdate, error) {
+	if len(data) > 0 && data[0] == '<' {
+		// It's HTML, try to extract JSON from script tags
+		if extracted, err := extractJSONFromHTML(data); err == nil {
+			data = extracted
+		}
+	}
+
 	var payload any
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, wanderer.TrailUpdate{}, err
@@ -110,6 +215,17 @@ func ParseV3Trail(data []byte) ([]providerkit.Point, wanderer.TrailUpdate, error
 		)
 	}
 	if !ok {
+		// Try __NEXT_DATA__ structure
+		if props, ok := at(payload, "props"); ok {
+			if pageProps, ok := at(props, "pageProps"); ok {
+				if trail, ok := at(pageProps, "trail"); ok {
+					payload = map[string]any{"trails": []any{trail}}
+					polyline, _ = stringAt(payload, "trails", "0", "defaultMap", "routes", "0", "lineSegments", "0", "polyline", "pointsData")
+				}
+			}
+		}
+	}
+	if polyline == "" {
 		return nil, wanderer.TrailUpdate{}, fmt.Errorf("AllTrails v3 JSON had no route polyline")
 	}
 	points, err := decodePolyline(polyline, 5)
@@ -146,6 +262,23 @@ func ParseV3Trail(data []byte) ([]providerkit.Point, wanderer.TrailUpdate, error
 	}
 	metadata.PhotoURLs = mergeStrings(metadata.PhotoURLs, alltrailsPhotoURLs(payload)...)
 	return points, metadata, nil
+}
+
+func extractJSONFromHTML(data []byte) ([]byte, error) {
+	s := string(data)
+	// Try __NEXT_DATA__
+	if start := strings.Index(s, `<script id="__NEXT_DATA__" type="application/json">`); start != -1 {
+		s = s[start+len(`<script id="__NEXT_DATA__" type="application/json">`):]
+		if end := strings.Index(s, `</script>`); end != -1 {
+			return []byte(s[:end]), nil
+		}
+	}
+	// Try a more generic regex for any JSON-like script tag that might contain trail data
+	re := regexp.MustCompile(`(?s)<script[^>]*>(.*?trails":.*?)</script>`)
+	if match := re.FindStringSubmatch(s); len(match) > 1 {
+		return []byte(match[1]), nil
+	}
+	return nil, fmt.Errorf("no JSON found in HTML")
 }
 
 func alltrailsPhotoURLs(payload any) []string {
@@ -305,4 +438,10 @@ func decodePolylineValue(encoded string, index int) (int, int, error) {
 		}
 	}
 	return 0, index, fmt.Errorf("truncated polyline")
+}
+
+func init() {
+	if publicAPIKey == "" {
+		log.Println("Warning: ALLTRAILS_API_KEY environment variable is missing; falling back to browser-based extraction")
+	}
 }

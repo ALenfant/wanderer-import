@@ -12,6 +12,7 @@ import (
 	"wanderer-import/internal/providers/cirkwi"
 	"wanderer-import/internal/providers/decathlonoutdoor"
 	"wanderer-import/internal/providers/direct"
+	"wanderer-import/internal/providers/engines/gpxlinks"
 	"wanderer-import/internal/providers/genericgpxlinks"
 	"wanderer-import/internal/providers/geotrekgard"
 	"wanderer-import/internal/providers/grandpicsaintloup"
@@ -26,6 +27,7 @@ import (
 	"wanderer-import/internal/providers/trailsviewer"
 	"wanderer-import/internal/providers/visorando"
 	"wanderer-import/internal/providers/visugpx"
+	"wanderer-import/internal/providers/wikiloc"
 )
 
 func Builtins(httpClient *http.Client) []importer.Provider {
@@ -45,7 +47,7 @@ func BuiltinsWithOptions(opts Options) []importer.Provider {
 		komoot.New(opts.HTTPClient),
 		sitytrail.New(opts.HTTPClient),
 		altituderando.New(opts.HTTPClient),
-		alltrails.New(opts.HTTPClient),
+		alltrails.NewWithOptions(alltrails.Options{HTTPClient: opts.HTTPClient, BrowserFetcher: opts.BrowserFetcher}),
 		bergfex.New(opts.HTTPClient),
 		trailsviewer.NewWithOptions(trailsviewer.Options{HTTPClient: opts.HTTPClient, BrowserFetcher: opts.BrowserFetcher}),
 		heraulttourisme.New(opts.HTTPClient),
@@ -55,10 +57,11 @@ func BuiltinsWithOptions(opts Options) []importer.Provider {
 		cevennestourisme.New(opts.HTTPClient),
 		grandpicsaintloup.New(opts.HTTPClient),
 		tourismelodevoislarzac.New(opts.HTTPClient),
-		visorando.New(opts.HTTPClient),
+		visorando.NewWithOptions(gpxlinks.Options{HTTPClient: opts.HTTPClient, BrowserFetcher: opts.BrowserFetcher}),
+		wikiloc.NewWithOptions(gpxlinks.Options{HTTPClient: opts.HTTPClient, BrowserFetcher: opts.BrowserFetcher}),
 		decathlonoutdoor.New(opts.HTTPClient),
 		helloways.New(opts.HTTPClient),
-		genericgpxlinks.New(opts.HTTPClient),
+		genericgpxlinks.NewWithOptions(gpxlinks.Options{HTTPClient: opts.HTTPClient, BrowserFetcher: opts.BrowserFetcher}),
 		direct.New(opts.HTTPClient),
 	}
 }

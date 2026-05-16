@@ -7,11 +7,15 @@ import (
 )
 
 func New(httpClient *http.Client) *gpxlinks.Provider {
-	return gpxlinks.NewProvider(gpxlinks.Config{
+	return NewWithOptions(gpxlinks.Options{HTTPClient: httpClient})
+}
+
+func NewWithOptions(opts gpxlinks.Options) *gpxlinks.Provider {
+	return gpxlinks.NewProviderWithOptions(gpxlinks.Config{
 		ID:                 "gpx-link-scraper",
 		Name:               "Generic GPX/KML/GeoJSON link scraper",
 		AllowAnyDomain:     true,
 		AllowExternalLinks: true,
 		Score:              50,
-	}, httpClient)
+	}, opts)
 }

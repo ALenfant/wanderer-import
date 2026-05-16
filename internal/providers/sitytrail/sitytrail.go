@@ -1,8 +1,11 @@
 package sitytrail
 
 import (
+	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 
 	"wanderer-import/internal/providers/engines/jsonpoints"
@@ -17,7 +20,7 @@ func New(httpClient *http.Client) *jsonpoints.Provider {
 		Domains: []string{"sitytrail.com", "geolives.com"},
 		Score:   90,
 		Templates: []string{
-			"https://capi.geolives.com/qq0zvz2zws4bq2lad0pu/sitytour/trails/{id}",
+			fmt.Sprintf("https://capi.geolives.com/%s/sitytour/trails/{id}", getSitytrailToken()),
 		},
 		ExtractID:     extractID,
 		Parse:         jsonpoints.ParseSityTrailWKT,
@@ -31,4 +34,12 @@ func extractID(parsed *url.URL) (string, bool) {
 		return "", false
 	}
 	return match[1], true
+}
+
+func getSitytrailToken() string {
+	t := os.Getenv("SITYTRAIL_TOKEN")
+	if t == "" {
+		log.Println("Warning: SITYTRAIL_TOKEN environment variable is missing; SityTrail extraction will fail")
+	}
+	return t
 }

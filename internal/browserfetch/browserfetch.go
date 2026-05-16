@@ -12,6 +12,7 @@ type Fetcher interface {
 type RequestOptions struct {
 	Headers map[string]string
 	Cookies map[string]string
+	Script  string
 }
 
 type Closeable interface {

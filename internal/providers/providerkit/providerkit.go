@@ -3,6 +3,7 @@ package providerkit
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
@@ -301,4 +302,88 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func ParseGeoJSON(data []byte) ([]Point, wanderer.TrailUpdate, error) {
+	var payload struct {
+		Type     string `json:"type"`
+		Features []struct {
+			Geometry struct {
+				Type        string          `json:"type"`
+				Coordinates json.RawMessage `json:"coordinates"`
+			} `json:"geometry"`
+		} `json:"features"`
+		Coordinates json.RawMessage `json:"coordinates"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, wanderer.TrailUpdate{}, err
+	}
+
+	var points []Point
+	extract := func(raw json.RawMessage, geomType string) error {
+		switch strings.ToLower(geomType) {
+		case "point":
+			var c []float64
+			if err := json.Unmarshal(raw, &c); err != nil {
+				return err
+			}
+			if len(c) >= 2 {
+				p := Point{Lon: c[0], Lat: c[1]}
+				if len(c) > 2 {
+					ele := c[2]
+					p.Ele = &ele
+				}
+				points = append(points, p)
+			}
+		case "linestring":
+			var coords [][]float64
+			if err := json.Unmarshal(raw, &coords); err != nil {
+				return err
+			}
+			for _, c := range coords {
+				if len(c) < 2 {
+					continue
+				}
+				p := Point{Lon: c[0], Lat: c[1]}
+				if len(c) > 2 {
+					ele := c[2]
+					p.Ele = &ele
+				}
+				points = append(points, p)
+			}
+		case "multilinestring":
+			var coords [][][]float64
+			if err := json.Unmarshal(raw, &coords); err != nil {
+				return err
+			}
+			for _, segment := range coords {
+				for _, c := range segment {
+					if len(c) < 2 {
+						continue
+					}
+					p := Point{Lon: c[0], Lat: c[1]}
+					if len(c) > 2 {
+						ele := c[2]
+						p.Ele = &ele
+					}
+					points = append(points, p)
+				}
+			}
+		}
+		return nil
+	}
+
+	if strings.ToLower(payload.Type) == "featurecollection" {
+		for _, f := range payload.Features {
+			_ = extract(f.Geometry.Coordinates, f.Geometry.Type)
+		}
+	} else {
+		_ = extract(payload.Coordinates, payload.Type)
+	}
+
+	if len(points) == 0 {
+		return nil, wanderer.TrailUpdate{}, fmt.Errorf("no points found in GeoJSON")
+	}
+
+	return points, MetadataFromPoints(points), nil
 }

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"wanderer-import/internal/browserfetch"
 	"wanderer-import/internal/importer"
 	"wanderer-import/internal/providers/providerkit"
 	"wanderer-import/internal/wanderer"
@@ -34,11 +35,21 @@ type Config struct {
 }
 
 type Provider struct {
-	cfg        Config
-	httpClient *http.Client
+	cfg            Config
+	httpClient     *http.Client
+	BrowserFetcher browserfetch.Fetcher
 }
 
 func NewProvider(cfg Config, httpClient *http.Client) *Provider {
+	return NewProviderWithOptions(cfg, Options{HTTPClient: httpClient})
+}
+
+type Options struct {
+	HTTPClient     *http.Client
+	BrowserFetcher browserfetch.Fetcher
+}
+
+func NewProviderWithOptions(cfg Config, opts Options) *Provider {
 	if cfg.Score == 0 {
 		if cfg.AllowAnyDomain {
 			cfg.Score = 50
@@ -46,7 +57,11 @@ func NewProvider(cfg Config, httpClient *http.Client) *Provider {
 			cfg.Score = 80
 		}
 	}
-	return &Provider{cfg: cfg, httpClient: providerkit.HTTPClient(httpClient)}
+	return &Provider{
+		cfg:            cfg,
+		httpClient:     providerkit.HTTPClient(opts.HTTPClient),
+		BrowserFetcher: opts.BrowserFetcher,
+	}
 }
 
 func (p *Provider) Name() string {
@@ -134,15 +149,19 @@ func (p *Provider) AnalyzePage(ctx context.Context, source string) (*PageAnalysi
 	if !ok {
 		return nil, fmt.Errorf("invalid HTTP URL %q", source)
 	}
+	var data []byte
 	res, err := providerkit.GET(ctx, p.httpClient, source)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		defer res.Body.Close()
+		data, err = io.ReadAll(io.LimitReader(res.Body, maxPageBytes))
 	}
-	defer res.Body.Close()
-
-	data, err := io.ReadAll(io.LimitReader(res.Body, maxPageBytes))
-	if err != nil {
-		return nil, err
+	if err != nil || len(data) == 0 {
+		if p.BrowserFetcher != nil {
+			data, err = p.BrowserFetcher.Fetch(ctx, source, source, browserfetch.RequestOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &PageAnalysis{
 		Links:    ExtractTrailLinks(base, data),

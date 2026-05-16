@@ -98,6 +98,26 @@ Session-related flags are available on both `import` and `export`:
   User-Agent sent to source websites.
 - `--referer URL` or `WANDERER_IMPORT_REFERER`: override the Referer sent to
   source websites.
+
+### Third-Party Credentials
+
+Some providers use hardcoded API keys or secrets to access their respective
+platforms. You can override these via environment variables (recommended for
+local development, often managed via `direnv` and a `.env` file):
+
+1. **Install direnv**: `brew install direnv` (or your platform's equivalent).
+2. **Setup .env**: Copy the template with `cp .env.example .env` and fill in your keys.
+3. **Allow direnv**: Run `direnv allow` in the project root.
+
+Available variables:
+- `ALLTRAILS_API_KEY`: API key for AllTrails v3 API.
+- `WIKILOC_API_KEY`: API key for Wikiloc mobile API.
+- `WIKILOC_SECRET_KEY`: Signing key for Wikiloc mobile API requests.
+- `SITYTRAIL_TOKEN`: Access token for SityTrail API.
+
+If these are missing, the CLI will log a warning and attempt to use alternative
+methods that do not require secrets (such as browser-based extraction or HTML
+parsing) if available.
 - `--impersonate chrome`, `--impersonate firefox`, or `--impersonate safari`:
   add browser-like User-Agent and request headers. When omitted, the CLI picks a
   matching header profile for `--cookies-from-browser chrome`, `firefox`, or

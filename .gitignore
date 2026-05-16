@@ -40,3 +40,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Reverse-engineering artifacts
+*.apk
+decompile_wikiloc_main/
+java_wrapper/
+*.class
