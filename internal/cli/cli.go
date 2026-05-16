@@ -807,20 +807,11 @@ func readSourcesFile(path string) ([]string, error) {
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		source := strings.TrimSpace(scanner.Text())
+		if source == "" || strings.HasPrefix(source, "#") {
 			continue
 		}
-		for _, part := range strings.Split(line, "|") {
-			source := strings.TrimSpace(part)
-			if source == "" {
-				continue
-			}
-			// Remove common prefixes like "alternative trace: "
-			source = strings.TrimPrefix(source, "alternative trace: ")
-			source = strings.TrimPrefix(source, "alternative: ")
-			sources = append(sources, source)
-		}
+		sources = append(sources, source)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
