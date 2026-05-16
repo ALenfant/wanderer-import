@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"wanderer-import/internal/browserfetch"
@@ -16,6 +18,7 @@ import (
 
 type Provider struct {
 	*gpxlinks.Provider
+	httpClient *http.Client
 }
 
 func New(httpClient *http.Client) *Provider {
@@ -31,6 +34,7 @@ func NewWithOptions(opts gpxlinks.Options) *Provider {
 			AllowExternalLinks: true,
 			Score:              90,
 		}, opts),
+		httpClient: providerkit.HTTPClient(opts.HTTPClient),
 	}
 }
 
@@ -50,13 +54,9 @@ func (p *Provider) Resolve(ctx context.Context, spec importer.Spec) (*importer.R
 		return nil, fmt.Errorf("wikiloc requires an HTTP URL")
 	}
 
-	// Extract trail ID from the URL. Wikiloc URLs come in two forms:
-	// /hiking-trails/151551929           → last segment is the ID
-	// /itineraires-randonnee/name-name-60586940 → ID is after the last dash
 	pathSegments := strings.Split(strings.TrimRight(sourceURL.Path, "/"), "/")
 	lastSegment := pathSegments[len(pathSegments)-1]
 
-	// The ID is either the whole last segment (if numeric) or after the last dash.
 	idStr := lastSegment
 	if dashParts := strings.Split(lastSegment, "-"); len(dashParts) > 1 {
 		idStr = dashParts[len(dashParts)-1]
@@ -69,7 +69,6 @@ func (p *Provider) Resolve(ctx context.Context, spec importer.Spec) (*importer.R
 		}
 	}
 
-	// Fall back to browser fetcher if available.
 	if p.Provider.BrowserFetcher != nil {
 		resolved, err := p.resolveViaBrowser(ctx, source)
 		if err == nil && resolved != nil {
@@ -77,7 +76,6 @@ func (p *Provider) Resolve(ctx context.Context, spec importer.Spec) (*importer.R
 		}
 	}
 
-	// Last resort: gpxlinks engine.
 	return p.Provider.Resolve(ctx, spec)
 }
 
@@ -105,17 +103,17 @@ func (p *Provider) resolveViaAPI(ctx context.Context, source, idStr string) (*im
 		return nil, fmt.Errorf("wikiloc API returned %d for trail %s", resp.StatusCode, idStr)
 	}
 
-	var response struct {
-		Geom string `json:"geom"`
-	}
+	var response map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return nil, err
 	}
-	if response.Geom == "" {
+
+	geom, _ := response["geom"].(string)
+	if geom == "" {
 		return nil, fmt.Errorf("wikiloc API returned empty geom for trail %s", idStr)
 	}
 
-	data, err := base64.StdEncoding.DecodeString(response.Geom)
+	data, err := base64.StdEncoding.DecodeString(geom)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode failed: %w", err)
 	}
@@ -129,7 +127,22 @@ func (p *Provider) resolveViaAPI(ctx context.Context, source, idStr string) (*im
 	}
 
 	metadata := providerkit.MetadataFromPoints(points)
+	
+	if name, ok := response["name"].(string); ok && name != "" {
+		metadata.Name = &name
+	} else if name, ok := response["title"].(string); ok && name != "" {
+		metadata.Name = &name
+	} else {
+		// Fallback: fetch page for name
+		if name := p.fetchNameFromPage(ctx, source); name != "" {
+			metadata.Name = &name
+		}
+	}
+
 	name := "wikiloc-" + idStr
+	if metadata.Name != nil {
+		name = *metadata.Name
+	}
 	body, err := providerkit.GPXReadCloser(name, points)
 	if err != nil {
 		return nil, err
@@ -143,10 +156,41 @@ func (p *Provider) resolveViaAPI(ctx context.Context, source, idStr string) (*im
 	}, nil
 }
 
+const (
+	googlebotUserAgent = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+)
+
+func (p *Provider) fetchNameFromPage(ctx context.Context, source string) string {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+	req.Header.Set("User-Agent", googlebotUserAgent)
+	res, err := p.httpClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer res.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	s := string(data)
+	re := regexp.MustCompile(`(?i)<title>(.*?)</title>`)
+	if match := re.FindStringSubmatch(s); len(match) > 1 {
+		title := strings.TrimSpace(match[1])
+		title = strings.Split(title, " | ")[0]
+		title = strings.Split(title, " - ")[0]
+		return title
+	}
+	return ""
+}
+
 func (p *Provider) resolveViaBrowser(ctx context.Context, source string) (*importer.ResolvedTrail, error) {
 	data, err := p.Provider.BrowserFetcher.Fetch(ctx, source, source, browserfetch.RequestOptions{
 		Script: `() => {
-			if (window.mapData && window.mapData.length > 0) return JSON.stringify(window.mapData);
+			const result = {
+				name: document.title.split("|")[0].trim().split(" - ")[0].trim(),
+				points: []
+			};
+			if (window.mapData && window.mapData.length > 0) {
+				result.points = window.mapData;
+				return JSON.stringify(result);
+			}
 			const findCoords = (obj) => {
 				if (!obj || typeof obj !== "object") return null;
 				if (Array.isArray(obj) && obj.length > 10 && obj[0].lat && (obj[0].lng || obj[0].lon)) return obj;
@@ -157,27 +201,33 @@ func (p *Provider) resolveViaBrowser(ctx context.Context, source string) (*impor
 				return null;
 			};
 			const coords = findCoords(window);
-			if (coords) return JSON.stringify(coords);
+			if (coords) {
+				result.points = coords;
+				return JSON.stringify(result);
+			}
 			return document.documentElement.outerHTML;
 		}`,
 	})
-	if err != nil || len(data) == 0 || data[0] != '[' {
+	if err != nil || len(data) == 0 || data[0] != '{' {
 		return nil, fmt.Errorf("browser fetch did not return coordinate JSON")
 	}
 
-	var rawPoints []struct {
-		Lat float64 `json:"lat"`
-		Lng float64 `json:"lng"`
-		Lon float64 `json:"lon"`
-		Ele float64 `json:"ele"`
-		Alt float64 `json:"alt"`
+	var browserPayload struct {
+		Name   string `json:"name"`
+		Points []struct {
+			Lat float64 `json:"lat"`
+			Lng float64 `json:"lng"`
+			Lon float64 `json:"lon"`
+			Ele float64 `json:"ele"`
+			Alt float64 `json:"alt"`
+		} `json:"points"`
 	}
-	if err := json.Unmarshal(data, &rawPoints); err != nil || len(rawPoints) == 0 {
+	if err := json.Unmarshal(data, &browserPayload); err != nil || len(browserPayload.Points) == 0 {
 		return nil, fmt.Errorf("failed to parse browser coordinate data")
 	}
 
-	points := make([]providerkit.Point, 0, len(rawPoints))
-	for _, rp := range rawPoints {
+	points := make([]providerkit.Point, 0, len(browserPayload.Points))
+	for _, rp := range browserPayload.Points {
 		pt := providerkit.Point{Lat: rp.Lat, Lon: rp.Lng}
 		if pt.Lon == 0 {
 			pt.Lon = rp.Lon
@@ -193,7 +243,14 @@ func (p *Provider) resolveViaBrowser(ctx context.Context, source string) (*impor
 	}
 
 	metadata := providerkit.MetadataFromPoints(points)
+	if browserPayload.Name != "" {
+		metadata.Name = &browserPayload.Name
+	}
+
 	name := "wikiloc-" + source
+	if metadata.Name != nil {
+		name = *metadata.Name
+	}
 	body, err := providerkit.GPXReadCloser(name, points)
 	if err != nil {
 		return nil, err

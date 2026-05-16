@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"regexp"
@@ -46,15 +47,16 @@ func (p *Provider) Resolve(ctx context.Context, spec importer.Spec) (*importer.R
 		return nil, fmt.Errorf("visorando requires an HTTP URL")
 	}
 
-	// 1. Fetch trail page with Googlebot UA
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	req.Header.Set("User-Agent", googlebotUserAgent)
 	res, err := p.httpClient.Do(req)
 	if err == nil {
 		defer res.Body.Close()
 		data, _ := io.ReadAll(io.LimitReader(res.Body, 2<<20))
+		
+		name := extractName(data)
+		
 		if id := extractHikeID(data); id != "" {
-			// 2. Fetch GeoJSON API with Googlebot UA
 			apiURL := fmt.Sprintf("https://www.visorando.com/index.php?component=exportData&task=getRandoGeoJson&wholePointsData=1&idRandonnee=%s", id)
 			reqAPI, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 			reqAPI.Header.Set("User-Agent", googlebotUserAgent)
@@ -67,14 +69,18 @@ func (p *Provider) Resolve(ctx context.Context, spec importer.Spec) (*importer.R
 				if err := json.NewDecoder(resAPI.Body).Decode(&payload); err == nil {
 					points, _, err := providerkit.ParseGeoJSON(payload.GeoJSON)
 					if err == nil && len(points) > 0 {
-						name := "visorando-" + id
+						if name == "" {
+							name = "visorando-" + id
+						}
 						body, err := providerkit.GPXReadCloser(name, points)
 						if err == nil {
+							metadata := providerkit.MetadataFromPoints(points)
+							metadata.Name = &name
 							return &importer.ResolvedTrail{
 								Source:   source,
 								Filename: providerkit.SlugFilename(name, ".gpx"),
 								Body:     body,
-								Metadata: providerkit.MetadataFromPoints(points),
+								Metadata: metadata,
 							}, nil
 						}
 					}
@@ -86,11 +92,18 @@ func (p *Provider) Resolve(ctx context.Context, spec importer.Spec) (*importer.R
 	return p.Provider.Resolve(ctx, spec)
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func extractName(data []byte) string {
+	s := string(data)
+	reTitle := regexp.MustCompile(`(?i)<title>(.*?)</title>`)
+	if match := reTitle.FindStringSubmatch(s); len(match) > 1 {
+		title := strings.TrimSpace(match[1])
+		title = html.UnescapeString(title)
+		title = strings.Split(title, " - ")[0]
+		title = strings.Split(title, " | ")[0]
+		title = strings.TrimPrefix(title, "A faire : ")
+		return title
 	}
-	return b
+	return ""
 }
 
 func extractHikeID(data []byte) string {

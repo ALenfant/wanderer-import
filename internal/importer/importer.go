@@ -185,6 +185,9 @@ func Import(ctx context.Context, client WandererClient, registry *Registry, spec
 	updated := false
 	var warnings []string
 	if !update.APISendableEmpty() {
+		if update.Name == nil && trail.Name != "" {
+			update.Name = &trail.Name
+		}
 		trail, err = client.UpdateTrail(ctx, trail.ID, update)
 		if err != nil {
 			return nil, err
@@ -221,6 +224,9 @@ func updateExistingTrail(ctx context.Context, client WandererClient, existing *w
 	updated := false
 	var warnings []string
 	if !update.APISendableEmpty() {
+		if update.Name == nil && existing.Name != "" {
+			update.Name = &existing.Name
+		}
 		var err error
 		trail, err = client.UpdateTrail(ctx, existing.ID, update)
 		if err != nil {
